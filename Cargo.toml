@@ -1,5 +1,5 @@
 [package]
-name = "virtio-drivers"
+name = "kvirtiodrivers"
 version = "0.13.0"
 license = "MIT"
 authors = [
@@ -10,7 +10,7 @@ authors = [
 ]
 edition = "2024"
 description = "VirtIO guest drivers."
-repository = "https://github.com/rcore-os/virtio-drivers"
+repository = "https://github.com/727Hsj/kvirtiodrivers.git"
 keywords = ["virtio"]
 categories = ["hardware-support", "no-std"]
 
