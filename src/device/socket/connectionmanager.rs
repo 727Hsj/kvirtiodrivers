@@ -1,9 +1,11 @@
 use super::{
     DEFAULT_RX_BUFFER_SIZE, DisconnectReason, SocketError, VirtIOSocket, VsockEvent,
-    VsockEventType, protocol::VsockAddr, vsock::ConnectionInfo,
+    VsockEventType,
+    protocol::{SeqPacketFlags, SocketType, VsockAddr},
+    vsock::ConnectionInfo,
 };
 use crate::{Hal, Result, transport::Transport};
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::cmp::min;
 use core::convert::TryInto;
 use core::hint::spin_loop;
@@ -51,13 +53,19 @@ pub struct VsockConnectionManager<
     driver: VirtIOSocket<H, T, RX_BUFFER_SIZE>,
     per_connection_buffer_capacity: u32,
     connections: Vec<Connection>,
-    listening_ports: Vec<u32>,
+    listening_ports: Vec<ListeningPort>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ListeningPort {
+    port: u32,
+    socket_type: SocketType,
 }
 
 #[derive(Debug)]
 struct Connection {
     info: ConnectionInfo,
-    buffer: RingBuffer,
+    rx_buffer: ConnectionRxBuffer,
     /// The peer sent a SHUTDOWN request, but we haven't yet responded with a RST because there is
     /// still data in the buffer.
     peer_requested_shutdown: bool,
@@ -65,11 +73,20 @@ struct Connection {
 
 impl Connection {
     fn new(peer: VsockAddr, local_port: u32, buffer_capacity: u32) -> Self {
-        let mut info = ConnectionInfo::new(peer, local_port);
+        Self::new_with_type(peer, local_port, buffer_capacity, SocketType::Stream)
+    }
+
+    fn new_with_type(
+        peer: VsockAddr,
+        local_port: u32,
+        buffer_capacity: u32,
+        socket_type: SocketType,
+    ) -> Self {
+        let mut info = ConnectionInfo::new_with_type(peer, local_port, socket_type);
         info.buf_alloc = buffer_capacity;
         Self {
             info,
-            buffer: RingBuffer::new(buffer_capacity.try_into().unwrap()),
+            rx_buffer: ConnectionRxBuffer::new(buffer_capacity.try_into().unwrap(), socket_type),
             peer_requested_shutdown: false,
         }
     }
@@ -104,14 +121,24 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
 
     /// Allows incoming connections on the given port number.
     pub fn listen(&mut self, port: u32) {
-        if !self.listening_ports.contains(&port) {
-            self.listening_ports.push(port);
+        self.listen_with_type(port, SocketType::Stream);
+    }
+
+    /// Allows incoming sequenced packet connections on the given port number.
+    pub fn listen_seqpacket(&mut self, port: u32) {
+        self.listen_with_type(port, SocketType::SeqPacket);
+    }
+
+    fn listen_with_type(&mut self, port: u32, socket_type: SocketType) {
+        let listening_port = ListeningPort { port, socket_type };
+        if !self.listening_ports.contains(&listening_port) {
+            self.listening_ports.push(listening_port);
         }
     }
 
     /// Stops allowing incoming connections on the given port number.
     pub fn unlisten(&mut self, port: u32) {
-        self.listening_ports.retain(|p| *p != port);
+        self.listening_ports.retain(|p| p.port != port);
     }
 
     /// Sends a request to connect to the given destination.
@@ -120,14 +147,32 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
     /// `VsockEventType::Connected` event indicating that the peer has accepted the connection
     /// before sending data.
     pub fn connect(&mut self, destination: VsockAddr, src_port: u32) -> Result {
+        self.connect_with_type(destination, src_port, SocketType::Stream)
+    }
+
+    /// Sends a sequenced packet connection request to the given destination.
+    pub fn connect_seqpacket(&mut self, destination: VsockAddr, src_port: u32) -> Result {
+        self.connect_with_type(destination, src_port, SocketType::SeqPacket)
+    }
+
+    fn connect_with_type(
+        &mut self,
+        destination: VsockAddr,
+        src_port: u32,
+        socket_type: SocketType,
+    ) -> Result {
         if self.connections.iter().any(|connection| {
             connection.info.dst == destination && connection.info.src_port == src_port
         }) {
             return Err(SocketError::ConnectionExists.into());
         }
 
-        let new_connection =
-            Connection::new(destination, src_port, self.per_connection_buffer_capacity);
+        let new_connection = Connection::new_with_type(
+            destination,
+            src_port,
+            self.per_connection_buffer_capacity,
+            socket_type,
+        );
 
         self.driver.connect(&new_connection.info)?;
         debug!("Connection requested: {:?}", new_connection.info);
@@ -140,6 +185,18 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
         let (_, connection) = get_connection(&mut self.connections, destination, src_port)?;
 
         self.driver.send(buffer, &mut connection.info)
+    }
+
+    /// Sends one sequenced packet message to the destination.
+    pub fn send_seqpacket(
+        &mut self,
+        destination: VsockAddr,
+        src_port: u32,
+        buffer: &[u8],
+    ) -> Result {
+        let (_, connection) = get_connection(&mut self.connections, destination, src_port)?;
+
+        self.driver.send_seqpacket(buffer, &mut connection.info)
     }
 
     /// Polls the vsock device to receive data or other updates.
@@ -162,10 +219,11 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
                 }
                 // Add the new connection to our list, at least for now. It will be removed again
                 // below if we weren't listening on the port.
-                connections.push(Connection::new(
+                connections.push(Connection::new_with_type(
                     event.source,
                     event.destination.port,
                     per_connection_buffer_capacity,
+                    event.socket_type,
                 ));
                 connections.last_mut().unwrap()
             } else {
@@ -176,10 +234,19 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
             connection.info.update_for_event(&event);
 
             if let VsockEventType::Received { length } = event.event_type {
-                // Copy to buffer
-                if !connection.buffer.add(body) {
+                let flags = SeqPacketFlags::from_bits_truncate(event.flags);
+                let Some(message_len) = connection.rx_buffer.add(body, flags) else {
+                    return Ok(None);
+                };
+                if message_len == 0 && length != 0 {
                     return Err(SocketError::OutputBufferTooShort(length).into());
                 }
+                return Ok(Some(VsockEvent {
+                    event_type: VsockEventType::Received {
+                        length: message_len,
+                    },
+                    ..event
+                }));
             }
 
             Ok(Some(event))
@@ -195,7 +262,11 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
 
         match event.event_type {
             VsockEventType::ConnectionRequest => {
-                if self.listening_ports.contains(&event.destination.port) {
+                let listening_port = ListeningPort {
+                    port: event.destination.port,
+                    socket_type: event.socket_type,
+                };
+                if self.listening_ports.contains(&listening_port) {
                     self.driver.accept(&connection.info)?;
                 } else {
                     // Reject the connection request and remove it from our list.
@@ -209,7 +280,7 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
             VsockEventType::Connected => {}
             VsockEventType::Disconnected { reason } => {
                 // Wait until client reads all data before removing connection.
-                if connection.buffer.is_empty() {
+                if connection.rx_buffer.is_empty() {
                     if reason == DisconnectReason::Shutdown {
                         self.driver.force_close(&connection.info)?;
                     }
@@ -238,13 +309,34 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
         let (connection_index, connection) = get_connection(&mut self.connections, peer, src_port)?;
 
         // Copy from ring buffer
-        let bytes_read = connection.buffer.drain(buffer);
+        let bytes_read = connection.rx_buffer.drain_stream(buffer);
 
         connection.info.done_forwarding(bytes_read);
 
         // If buffer is now empty and the peer requested shutdown, finish shutting down the
         // connection.
-        if connection.peer_requested_shutdown && connection.buffer.is_empty() {
+        if connection.peer_requested_shutdown && connection.rx_buffer.is_empty() {
+            self.driver.force_close(&connection.info)?;
+            self.connections.swap_remove(connection_index);
+        }
+
+        Ok(bytes_read)
+    }
+
+    /// Reads one sequenced packet message received from the given connection.
+    pub fn recv_seqpacket(
+        &mut self,
+        peer: VsockAddr,
+        src_port: u32,
+        buffer: &mut [u8],
+    ) -> Result<usize> {
+        let (connection_index, connection) = get_connection(&mut self.connections, peer, src_port)?;
+        let (bytes_read, forwarded_bytes) =
+            connection.rx_buffer.drain_seqpacket_with_forwarded(buffer);
+
+        connection.info.done_forwarding(forwarded_bytes);
+
+        if connection.peer_requested_shutdown && connection.rx_buffer.is_empty() {
             self.driver.force_close(&connection.info)?;
             self.connections.swap_remove(connection_index);
         }
@@ -258,7 +350,7 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize>
     /// contain any data.
     pub fn recv_buffer_available_bytes(&mut self, peer: VsockAddr, src_port: u32) -> Result<usize> {
         let (_, connection) = get_connection(&mut self.connections, peer, src_port)?;
-        Ok(connection.buffer.used())
+        Ok(connection.rx_buffer.used())
     }
 
     /// Sends a credit update to the given peer.
@@ -329,6 +421,115 @@ fn get_connection_for_event<'a>(
         .iter_mut()
         .enumerate()
         .find(|(_, connection)| event.matches_connection(&connection.info, local_cid))
+}
+
+#[derive(Debug)]
+enum ConnectionRxBuffer {
+    Stream(RingBuffer),
+    SeqPacket(SeqPacketBuffer),
+}
+
+impl ConnectionRxBuffer {
+    fn new(capacity: usize, socket_type: SocketType) -> Self {
+        match socket_type {
+            SocketType::Stream => Self::Stream(RingBuffer::new(capacity)),
+            SocketType::SeqPacket => Self::SeqPacket(SeqPacketBuffer::new(capacity)),
+        }
+    }
+
+    fn used(&self) -> usize {
+        match self {
+            Self::Stream(buffer) => buffer.used(),
+            Self::SeqPacket(buffer) => buffer.used(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Stream(buffer) => buffer.is_empty(),
+            Self::SeqPacket(buffer) => buffer.is_empty(),
+        }
+    }
+
+    fn add(&mut self, bytes: &[u8], flags: SeqPacketFlags) -> Option<usize> {
+        match self {
+            Self::Stream(buffer) => Some(if buffer.add(bytes) { bytes.len() } else { 0 }),
+            Self::SeqPacket(buffer) => buffer.add(bytes, flags),
+        }
+    }
+
+    fn drain_stream(&mut self, out: &mut [u8]) -> usize {
+        match self {
+            Self::Stream(buffer) => buffer.drain(out),
+            Self::SeqPacket(buffer) => buffer.drain_message(out).0,
+        }
+    }
+
+    fn drain_seqpacket_with_forwarded(&mut self, out: &mut [u8]) -> (usize, usize) {
+        match self {
+            Self::Stream(buffer) => {
+                let bytes_read = buffer.drain(out);
+                (bytes_read, bytes_read)
+            }
+            Self::SeqPacket(buffer) => buffer.drain_message(out),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SeqPacketBuffer {
+    messages: VecDeque<Vec<u8>>,
+    partial: Vec<u8>,
+    capacity: usize,
+    used: usize,
+}
+
+impl SeqPacketBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            messages: VecDeque::new(),
+            partial: Vec::new(),
+            capacity,
+            used: 0,
+        }
+    }
+
+    fn used(&self) -> usize {
+        self.messages.front().map_or(0, Vec::len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.partial.is_empty()
+    }
+
+    fn add(&mut self, bytes: &[u8], flags: SeqPacketFlags) -> Option<usize> {
+        if bytes.len() > self.capacity.saturating_sub(self.used) {
+            return Some(0);
+        }
+
+        self.partial.extend_from_slice(bytes);
+        self.used += bytes.len();
+
+        if !flags.contains(SeqPacketFlags::EOM) {
+            return None;
+        }
+
+        let message = core::mem::take(&mut self.partial);
+        let message_len = message.len();
+        self.messages.push_back(message);
+        Some(message_len)
+    }
+
+    fn drain_message(&mut self, out: &mut [u8]) -> (usize, usize) {
+        let Some(message) = self.messages.pop_front() else {
+            return (0, 0);
+        };
+
+        let bytes_read = min(message.len(), out.len());
+        out[..bytes_read].copy_from_slice(&message[..bytes_read]);
+        self.used -= message.len();
+        (bytes_read, message.len())
+    }
 }
 
 #[derive(Debug)]
@@ -605,6 +806,8 @@ mod tests {
                     port: guest_port,
                 },
                 event_type: VsockEventType::Connected,
+                socket_type: SocketType::Stream,
+                flags: 0,
                 buffer_status: VsockBufferStatus {
                     buffer_allocation: 50,
                     forward_count: 0,
@@ -627,6 +830,8 @@ mod tests {
                 event_type: VsockEventType::Received {
                     length: hello_from_host.len()
                 },
+                socket_type: SocketType::Stream,
+                flags: 0,
                 buffer_status: VsockBufferStatus {
                     buffer_allocation: 50,
                     forward_count: hello_from_guest.len() as u32,
@@ -790,6 +995,8 @@ mod tests {
                     port: guest_port,
                 },
                 event_type: VsockEventType::ConnectionRequest,
+                socket_type: SocketType::Stream,
+                flags: 0,
                 buffer_status: VsockBufferStatus {
                     buffer_allocation: 50,
                     forward_count: 0,

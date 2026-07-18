@@ -3,7 +3,8 @@
 use super::DEFAULT_RX_BUFFER_SIZE;
 use super::error::SocketError;
 use super::protocol::{
-    Feature, StreamShutdown, VirtioVsockConfig, VirtioVsockHdr, VirtioVsockOp, VsockAddr,
+    Feature, SeqPacketFlags, SocketType, StreamShutdown, VirtioVsockConfig, VirtioVsockHdr,
+    VirtioVsockOp, VsockAddr,
 };
 use crate::Result;
 use crate::config::read_config;
@@ -22,7 +23,8 @@ pub(crate) const QUEUE_SIZE: usize = 8;
 const SUPPORTED_FEATURES: Feature = Feature::RING_EVENT_IDX
     .union(Feature::RING_INDIRECT_DESC)
     .union(Feature::VERSION_1)
-    .union(Feature::ACCESS_PLATFORM);
+    .union(Feature::ACCESS_PLATFORM)
+    .union(Feature::SEQ_PACKET);
 
 /// Information about a particular vsock connection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,15 +51,23 @@ pub struct ConnectionInfo {
     /// This is set to true when we send a `VIRTIO_VSOCK_OP_CREDIT_REQUEST`, and false when we
     /// receive a `VIRTIO_VSOCK_OP_CREDIT_UPDATE`.
     has_pending_credit_request: bool,
+    /// Socket type used for this connection.
+    pub socket_type: SocketType,
 }
 
 impl ConnectionInfo {
     /// Creates a new `ConnectionInfo` for the given peer address and local port, and default values
     /// for everything else.
     pub fn new(destination: VsockAddr, src_port: u32) -> Self {
+        Self::new_with_type(destination, src_port, SocketType::Stream)
+    }
+
+    /// Creates a new `ConnectionInfo` for the given peer address, local port, and socket type.
+    pub fn new_with_type(destination: VsockAddr, src_port: u32, socket_type: SocketType) -> Self {
         Self {
             dst: destination,
             src_port,
+            socket_type,
             ..Default::default()
         }
     }
@@ -93,6 +103,7 @@ impl ConnectionInfo {
             dst_cid: self.dst.cid.into(),
             src_port: self.src_port.into(),
             dst_port: self.dst.port.into(),
+            socket_type: self.socket_type.into(),
             buf_alloc: self.buf_alloc.into(),
             fwd_cnt: self.fwd_cnt.into(),
             ..Default::default()
@@ -111,6 +122,10 @@ pub struct VsockEvent {
     pub buffer_status: VsockBufferStatus,
     /// The type of event.
     pub event_type: VsockEventType,
+    /// Socket type carried by the VirtIO vsock packet header.
+    pub socket_type: SocketType,
+    /// Operation-specific flags carried by the VirtIO vsock packet header.
+    pub flags: u32,
 }
 
 impl VsockEvent {
@@ -123,6 +138,7 @@ impl VsockEvent {
 
     fn from_header(header: &VirtioVsockHdr) -> Result<Self> {
         let op = header.op()?;
+        let socket_type = header.socket_type.try_into()?;
         let buffer_status = VsockBufferStatus {
             buffer_allocation: header.buf_alloc.into(),
             forward_count: header.fwd_cnt.into(),
@@ -168,6 +184,8 @@ impl VsockEvent {
             destination,
             buffer_status,
             event_type,
+            socket_type,
+            flags: header.flags.get(),
         })
     }
 }
@@ -229,6 +247,7 @@ pub struct VirtIOSocket<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize = DEFA
     /// The guest_cid field contains the guest’s context ID, which uniquely identifies
     /// the device for its lifetime. The upper 32 bits of the CID are reserved and zeroed.
     guest_cid: u64,
+    features: Feature,
 }
 
 impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> Drop
@@ -248,7 +267,7 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
     pub fn new(mut transport: T) -> Result<Self> {
         assert!(RX_BUFFER_SIZE > size_of::<VirtioVsockHdr>());
 
-        let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
+        let features = transport.begin_init(SUPPORTED_FEATURES);
 
         let guest_cid = transport.read_consistent(|| {
             Ok(
@@ -261,23 +280,23 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
         let rx = VirtQueue::new(
             &mut transport,
             RX_QUEUE_IDX,
-            negotiated_features.contains(Feature::RING_INDIRECT_DESC),
-            negotiated_features.contains(Feature::RING_EVENT_IDX),
-            negotiated_features.contains(Feature::ACCESS_PLATFORM),
+            features.contains(Feature::RING_INDIRECT_DESC),
+            features.contains(Feature::RING_EVENT_IDX),
+            features.contains(Feature::ACCESS_PLATFORM),
         )?;
         let tx = VirtQueue::new(
             &mut transport,
             TX_QUEUE_IDX,
-            negotiated_features.contains(Feature::RING_INDIRECT_DESC),
-            negotiated_features.contains(Feature::RING_EVENT_IDX),
-            negotiated_features.contains(Feature::ACCESS_PLATFORM),
+            features.contains(Feature::RING_INDIRECT_DESC),
+            features.contains(Feature::RING_EVENT_IDX),
+            features.contains(Feature::ACCESS_PLATFORM),
         )?;
         let event = VirtQueue::new(
             &mut transport,
             EVENT_QUEUE_IDX,
-            negotiated_features.contains(Feature::RING_INDIRECT_DESC),
-            negotiated_features.contains(Feature::RING_EVENT_IDX),
-            negotiated_features.contains(Feature::ACCESS_PLATFORM),
+            features.contains(Feature::RING_INDIRECT_DESC),
+            features.contains(Feature::RING_EVENT_IDX),
+            features.contains(Feature::ACCESS_PLATFORM),
         )?;
 
         let rx = OwningQueue::new(rx)?;
@@ -293,6 +312,7 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
             tx,
             event,
             guest_cid,
+            features,
         })
     }
 
@@ -301,12 +321,20 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
         self.guest_cid
     }
 
+    /// Returns true when the negotiated device features allow SOCK_SEQPACKET.
+    pub fn seqpacket_supported(&self) -> bool {
+        self.features.contains(Feature::SEQ_PACKET)
+    }
+
     /// Sends a request to connect to the given destination.
     ///
     /// This returns as soon as the request is sent; you should wait until `poll` returns a
     /// `VsockEventType::Connected` event indicating that the peer has accepted the connection
     /// before sending data.
     pub fn connect(&mut self, connection_info: &ConnectionInfo) -> Result {
+        if connection_info.socket_type == SocketType::SeqPacket && !self.seqpacket_supported() {
+            return Err(crate::Error::Unsupported);
+        }
         let header = VirtioVsockHdr {
             op: VirtioVsockOp::Request.into(),
             ..connection_info.new_header(self.guest_cid)
@@ -336,12 +364,36 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
 
     /// Sends the buffer to the destination.
     pub fn send(&mut self, buffer: &[u8], connection_info: &mut ConnectionInfo) -> Result {
+        self.send_with_flags(buffer, connection_info, SeqPacketFlags::empty())
+    }
+
+    /// Sends the buffer as one sequenced packet message to the destination.
+    pub fn send_seqpacket(
+        &mut self,
+        buffer: &[u8],
+        connection_info: &mut ConnectionInfo,
+    ) -> Result {
+        self.send_with_flags(buffer, connection_info, SeqPacketFlags::EOM)
+    }
+
+    fn send_with_flags(
+        &mut self,
+        buffer: &[u8],
+        connection_info: &mut ConnectionInfo,
+        seqpacket_flags: SeqPacketFlags,
+    ) -> Result {
         self.check_peer_buffer_is_sufficient(connection_info, buffer.len())?;
 
         let len = buffer.len() as u32;
+        let flags = if connection_info.socket_type == SocketType::SeqPacket {
+            seqpacket_flags.into()
+        } else {
+            0.into()
+        };
         let header = VirtioVsockHdr {
             op: VirtioVsockOp::Rw.into(),
             len: len.into(),
+            flags,
             ..connection_info.new_header(self.guest_cid)
         };
         connection_info.tx_cnt += len;

@@ -18,6 +18,7 @@ impl embedded_io::Error for Error {
                 SocketError::BufferTooLong(_, _) => ErrorKind::InvalidInput,
                 SocketError::InsufficientBufferSpaceInPeer => ErrorKind::WriteZero,
                 SocketError::UnknownOperation(_)
+                | SocketError::InvalidSocketType(_)
                 | SocketError::InvalidOperation
                 | SocketError::InvalidNumber
                 | SocketError::UnexpectedDataInPacket

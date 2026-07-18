@@ -17,7 +17,7 @@ mod vsock;
 #[cfg(feature = "alloc")]
 pub use connectionmanager::VsockConnectionManager;
 pub use error::SocketError;
-pub use protocol::{StreamShutdown, VMADDR_CID_HOST, VsockAddr};
+pub use protocol::{SeqPacketFlags, SocketType, StreamShutdown, VMADDR_CID_HOST, VsockAddr};
 #[cfg(feature = "alloc")]
 pub use vsock::{ConnectionInfo, DisconnectReason, VirtIOSocket, VsockEvent, VsockEventType};
 

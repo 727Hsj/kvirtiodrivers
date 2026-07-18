@@ -29,6 +29,9 @@ pub enum SocketError {
     /// Unknown operation.
     #[error("The operation code '{0}' is unknown")]
     UnknownOperation(u16),
+    /// Unknown socket type.
+    #[error("The socket type '{0}' is unknown")]
+    InvalidSocketType(u16),
     /// Invalid operation,
     #[error("Invalid operation")]
     InvalidOperation,

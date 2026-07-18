@@ -15,14 +15,27 @@ use zerocopy::{
 /// Well-known CID for the host.
 pub const VMADDR_CID_HOST: u64 = 2;
 
-/// Currently only stream sockets are supported. type is 1 for stream socket types.
-#[derive(Copy, Clone, Debug)]
+/// VirtIO vsock socket type.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[repr(u16)]
 pub enum SocketType {
     /// Stream sockets provide in-order, guaranteed, connection-oriented delivery without message boundaries.
+    #[default]
     Stream = 1,
     /// seqpacket socket type introduced in virtio-v1.2.
     SeqPacket = 2,
+}
+
+impl TryFrom<U16<LittleEndian>> for SocketType {
+    type Error = SocketError;
+
+    fn try_from(value: U16<LittleEndian>) -> Result<Self, Self::Error> {
+        match value.get() {
+            1 => Ok(Self::Stream),
+            2 => Ok(Self::SeqPacket),
+            _ => Err(SocketError::InvalidSocketType(value.get())),
+        }
+    }
 }
 
 impl From<SocketType> for U16<LittleEndian> {
@@ -213,6 +226,23 @@ bitflags! {
         const ORDER_PLATFORM        = 1 << 36;
         const SR_IOV                = 1 << 37;
         const NOTIFICATION_DATA     = 1 << 38;
+    }
+}
+
+bitflags! {
+    /// Flags sent with a sequenced packet data packet.
+    #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+    pub struct SeqPacketFlags: u32 {
+        /// End of a sequenced packet message.
+        const EOM = 1 << 0;
+        /// End of record marker requested by the sender.
+        const EOR = 1 << 1;
+    }
+}
+
+impl From<SeqPacketFlags> for U32<LittleEndian> {
+    fn from(flags: SeqPacketFlags) -> Self {
+        flags.bits().into()
     }
 }
 
