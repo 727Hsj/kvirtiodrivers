@@ -81,6 +81,38 @@ impl ConnectionInfo {
         self.fwd_cnt += length as u32;
     }
 
+    /// Sets the number of bytes of packet bodies which we have sent to the peer.
+    pub fn set_tx_cnt(&mut self, tx_cnt: u32) {
+        self.tx_cnt = tx_cnt;
+    }
+
+    /// Sets the number of bytes of packet bodies which we have received from the
+    /// peer and handled.
+    pub fn set_fwd_cnt(&mut self, fwd_cnt: u32) {
+        self.fwd_cnt = fwd_cnt;
+    }
+
+    /// Sets the last `buf_alloc` value the peer sent to us.
+    pub fn set_peer_buf_alloc(&mut self, peer_buf_alloc: u32) {
+        self.peer_buf_alloc = peer_buf_alloc;
+    }
+
+    /// Sets the last `fwd_cnt` value the peer sent to us.
+    pub fn set_peer_fwd_cnt(&mut self, peer_fwd_cnt: u32) {
+        self.peer_fwd_cnt = peer_fwd_cnt;
+    }
+
+    /// Returns the number of bytes of packet bodies which we have sent to the peer.
+    pub fn tx_cnt(&self) -> u32 {
+        self.tx_cnt
+    }
+
+    /// Returns the number of bytes of packet bodies which we have received from
+    /// the peer and handled.
+    pub fn fwd_cnt(&self) -> u32 {
+        self.fwd_cnt
+    }
+
     /// Returns the number of bytes of RX buffer space the peer has available to receive packet body
     /// data from us.
     fn peer_free(&self) -> u32 {
