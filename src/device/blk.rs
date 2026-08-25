@@ -383,6 +383,62 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         resp.status.into()
     }
 
+    /// Submits a flush request, but returns immediately without waiting for it to complete.
+    ///
+    /// This is the non-blocking counterpart of [`Self::flush`]. The caller must
+    /// keep `req` and `resp` valid (and not otherwise accessed) until the
+    /// corresponding [`Self::complete_flush`] call succeeds.
+    ///
+    /// Returns `Ok(())` immediately (without notifying the device) if the
+    /// `VIRTIO_BLK_F_FLUSH` feature was not negotiated — the flush is a no-op
+    /// in that case and there is no token to complete.
+    ///
+    /// # Safety
+    ///
+    /// `req` and `resp` are still borrowed by the underlying VirtIO block
+    /// device even after this method returns. The caller must not access them
+    /// before the request is completed (via [`Self::complete_flush`]) to avoid
+    /// data races.
+    pub unsafe fn flush_nb(&mut self, req: &mut BlkReq, resp: &mut BlkResp) -> Result<Option<u16>> {
+        if !self.negotiated_features.contains(BlkFeature::FLUSH) {
+            return Ok(None);
+        }
+        *req = BlkReq {
+            type_: ReqType::Flush,
+            ..Default::default()
+        };
+        // SAFETY: The caller promises that `req` and `resp` are not accessed
+        // before the request is completed.
+        let token = unsafe { self.queue.add(&[req.as_bytes()], &mut [resp.as_mut_bytes()])? };
+        if self.queue.should_notify() {
+            self.transport.notify(QUEUE);
+        }
+        Ok(Some(token))
+    }
+
+    /// Completes a flush operation started by [`Self::flush_nb`].
+    ///
+    /// `token` must be the value returned by the corresponding `flush_nb` call.
+    ///
+    /// # Safety
+    ///
+    /// The same `req` and `resp` must be passed in again as were passed to
+    /// `flush_nb` when it returned the token.
+    pub unsafe fn complete_flush(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        resp: &mut BlkResp,
+    ) -> Result<()> {
+        // SAFETY: The caller promises that `req` and `resp` are the same that
+        // were passed to the corresponding `flush_nb` call.
+        unsafe {
+            self.queue
+                .pop_used(token, &[req.as_bytes()], &mut [resp.as_mut_bytes()])?;
+        }
+        resp.status.into()
+    }
+
     /// Fetches the token of the next completed request from the used ring and returns it, without
     /// removing it from the used ring. If there are no pending completed requests returns `None`.
     pub fn peek_used(&mut self) -> Option<u16> {

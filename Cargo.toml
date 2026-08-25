@@ -1,6 +1,6 @@
 [package]
 name = "kvirtiodrivers"
-version = "0.13.2"
+version = "0.13.3"
 license = "MIT"
 authors = [
   "Jiajie Chen <noc@jiegec.ac.cn>",
