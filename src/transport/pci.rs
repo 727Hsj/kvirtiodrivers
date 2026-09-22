@@ -45,6 +45,12 @@ pub(crate) const CAP_LENGTH_OFFSET: u8 = 12;
 /// The offset of the`notify_off_multiplier` field within `virtio_pci_notify_cap`.
 pub(crate) const CAP_NOTIFY_OFF_MULTIPLIER_OFFSET: u8 = 16;
 
+/// Queues whose notify addresses are cached at `queue_set` time.
+///
+/// VirtIO-net uses 2 queues. Extra queues still notify correctly by re-reading
+/// `queue_notify_off`. Kept small so `PciTransport` does not bloat `SomeTransport`.
+const NOTIFY_CACHE: usize = 4;
+
 /// Common configuration.
 pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 /// Notifications.
@@ -91,6 +97,11 @@ pub struct PciTransport {
     /// The start of the queue notification region within some BAR.
     notify_region: UniqueMmioPointer<'static, [WriteOnly<u16>]>,
     notify_off_multiplier: u32,
+    /// Notify-region index for recently enabled queues.
+    ///
+    /// Linux `vp_modern_map_vq_notify` stores this pointer on the virtqueue so
+    /// `vp_notify` is a single doorbell write.
+    notify_cache: [Option<(u16, u32)>; NOTIFY_CACHE],
     /// The ISR status register within some BAR.
     isr_status: UniqueMmioPointer<'static, ReadOnly<u8>>,
     /// The VirtIO device-specific configuration within some BAR.
@@ -213,9 +224,49 @@ impl PciTransport {
             common_cfg,
             notify_region,
             notify_off_multiplier,
+            notify_cache: [None; NOTIFY_CACHE],
             isr_status,
             config_space,
         })
+    }
+
+    /// Reads `queue_notify_off` for the already-selected queue and caches it.
+    ///
+    /// The caller must have written `queue_select` for `queue`.
+    fn cache_notify_index(&mut self, queue: u16) {
+        let index = self.notify_index_from_common() as u32;
+        if let Some(slot) = self
+            .notify_cache
+            .iter_mut()
+            .find(|entry| matches!(entry, Some((cached, _)) if *cached == queue) || entry.is_none())
+        {
+            *slot = Some((queue, index));
+            return;
+        }
+        self.notify_cache[0] = Some((queue, index));
+    }
+
+    fn notify_index_from_common(&mut self) -> usize {
+        let queue_notify_off = field_shared!(self.common_cfg, queue_notify_off).read();
+        let offset_bytes = usize::from(queue_notify_off) * self.notify_off_multiplier as usize;
+        offset_bytes / size_of::<u16>()
+    }
+
+    fn notify_index(&mut self, queue: u16) -> usize {
+        if let Some(&(_, index)) = self
+            .notify_cache
+            .iter()
+            .flatten()
+            .find(|(cached, _)| *cached == queue)
+        {
+            return index as usize;
+        }
+        field!(self.common_cfg, queue_select).write(queue);
+        let index = self.notify_index_from_common();
+        if let Some(slot) = self.notify_cache.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some((queue, index as u32));
+        }
+        index
     }
 }
 
@@ -246,12 +297,7 @@ impl Transport for PciTransport {
     }
 
     fn notify(&mut self, queue: u16) {
-        field!(self.common_cfg, queue_select).write(queue);
-        // TODO: Consider caching this somewhere (per queue).
-        let queue_notify_off = field_shared!(self.common_cfg, queue_notify_off).read();
-
-        let offset_bytes = usize::from(queue_notify_off) * self.notify_off_multiplier as usize;
-        let index = offset_bytes / size_of::<u16>();
+        let index = self.notify_index(queue);
         self.notify_region.get(index).unwrap().write(queue);
     }
 
@@ -286,6 +332,7 @@ impl Transport for PciTransport {
         field!(self.common_cfg, queue_driver).write(driver_area);
         field!(self.common_cfg, queue_device).write(device_area);
         field!(self.common_cfg, queue_enable).write(1);
+        self.cache_notify_index(queue);
     }
 
     fn queue_unset(&mut self, _queue: u16) {

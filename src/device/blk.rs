@@ -409,7 +409,10 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         };
         // SAFETY: The caller promises that `req` and `resp` are not accessed
         // before the request is completed.
-        let token = unsafe { self.queue.add(&[req.as_bytes()], &mut [resp.as_mut_bytes()])? };
+        let token = unsafe {
+            self.queue
+                .add(&[req.as_bytes()], &mut [resp.as_mut_bytes()])?
+        };
         if self.queue.should_notify() {
             self.transport.notify(QUEUE);
         }
