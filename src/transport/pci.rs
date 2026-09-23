@@ -45,10 +45,9 @@ pub(crate) const CAP_LENGTH_OFFSET: u8 = 12;
 /// The offset of the`notify_off_multiplier` field within `virtio_pci_notify_cap`.
 pub(crate) const CAP_NOTIFY_OFF_MULTIPLIER_OFFSET: u8 = 16;
 
-/// Queues whose notify addresses are cached at `queue_set` time.
+/// Number of cached queue notification addresses.
 ///
-/// VirtIO-net uses 2 queues. Extra queues still notify correctly by re-reading
-/// `queue_notify_off`. Kept small so `PciTransport` does not bloat `SomeTransport`.
+/// Extra queues read `queue_notify_off` on each notification.
 const NOTIFY_CACHE: usize = 4;
 
 /// Common configuration.
@@ -97,7 +96,7 @@ pub struct PciTransport {
     /// The start of the queue notification region within some BAR.
     notify_region: UniqueMmioPointer<'static, [WriteOnly<u16>]>,
     notify_off_multiplier: u32,
-    /// Notify-region index for recently enabled queues.
+    /// Notify-region index for up to four queues.
     ///
     /// Linux `vp_modern_map_vq_notify` stores this pointer on the virtqueue so
     /// `vp_notify` is a single doorbell write.
@@ -234,16 +233,12 @@ impl PciTransport {
     ///
     /// The caller must have written `queue_select` for `queue`.
     fn cache_notify_index(&mut self, queue: u16) {
-        let index = self.notify_index_from_common() as u32;
-        if let Some(slot) = self
-            .notify_cache
-            .iter_mut()
-            .find(|entry| matches!(entry, Some((cached, _)) if *cached == queue) || entry.is_none())
-        {
-            *slot = Some((queue, index));
-            return;
+        if let Some(slot) = self.notify_cache.iter().position(|entry| {
+            matches!(entry, Some((cached, _)) if *cached == queue) || entry.is_none()
+        }) {
+            let index = self.notify_index_from_common() as u32;
+            self.notify_cache[slot] = Some((queue, index));
         }
-        self.notify_cache[0] = Some((queue, index));
     }
 
     fn notify_index_from_common(&mut self) -> usize {
