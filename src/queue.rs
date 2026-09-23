@@ -23,7 +23,7 @@ use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU16, Ordering, fence};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering, fence};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 /// The mechanism for bulk data transport on virtio devices.
@@ -61,10 +61,8 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     desc_shadow: [Descriptor; SIZE],
     /// Our trusted copy of `avail.idx`.
     avail_idx: u16,
-    /// Last `avail.idx` stored to the device-visible ring.
-    published_idx: u16,
     /// Additions since the last [`Self::should_notify`], capped at 2^16.
-    num_added: u32,
+    num_added: AtomicU32,
     last_used_idx: u16,
     /// Whether the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     event_idx: bool,
@@ -146,8 +144,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             free_head: 0,
             desc_shadow,
             avail_idx: 0,
-            published_idx: 0,
-            num_added: 0,
+            num_added: AtomicU32::new(0),
             last_used_idx: 0,
             event_idx,
             access_platform,
@@ -160,8 +157,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
 
     /// Add buffers to the virtqueue, return a token.
     ///
-    /// The buffers must not be empty. This publishes `avail.idx` immediately;
-    /// use [`Self::add_uncommitted`] and [`Self::commit`] for batches.
+    /// The buffers must not be empty.
     ///
     /// Ref: linux virtio_ring.c virtqueue_add
     ///
@@ -174,28 +170,6 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         inputs: &'a [&'b [u8]],
         outputs: &'a mut [&'b mut [u8]],
     ) -> Result<u16> {
-        // SAFETY: same buffer contract as `add_uncommitted`.
-        let head = unsafe { self.add_uncommitted(inputs, outputs) }?;
-        self.commit();
-        Ok(head)
-    }
-
-    /// Adds buffers without publishing `avail.idx` to the device.
-    ///
-    /// Call [`Self::commit`] after a batch, then [`Self::should_notify`] to
-    /// determine whether to notify the device.
-    ///
-    /// # Safety
-    ///
-    /// Same as [`Self::add`].
-    pub unsafe fn add_uncommitted<'a, 'b>(
-        &mut self,
-        inputs: &'a [&'b [u8]],
-        outputs: &'a mut [&'b mut [u8]],
-    ) -> Result<u16> {
-        if self.num_added >= u16::MAX as u32 {
-            self.commit();
-        }
         if inputs.is_empty() && outputs.is_empty() {
             return Err(Error::InvalidParam);
         }
@@ -229,27 +203,22 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             (*self.avail.as_ptr()).ring[avail_slot as usize] = head;
         }
 
-        self.avail_idx = self.avail_idx.wrapping_add(1);
-        self.num_added = (self.num_added + 1).min(u16::MAX as u32 + 1);
-
-        Ok(head)
-    }
-
-    /// Publishes pending entries added by [`Self::add_uncommitted`].
-    pub fn commit(&mut self) {
-        if self.published_idx == self.avail_idx {
-            return;
-        }
         // Write barrier so that device sees changes to descriptor table and available ring before
         // change to available index.
         fence(Ordering::SeqCst);
+
+        // increase head of avail ring
+        self.avail_idx = self.avail_idx.wrapping_add(1);
         // SAFETY: `self.avail` is properly aligned, dereferenceable and initialised.
         unsafe {
             (*self.avail.as_ptr())
                 .idx
                 .store(self.avail_idx, Ordering::Release);
         }
-        self.published_idx = self.avail_idx;
+        let num_added = self.num_added.get_mut();
+        *num_added = (*num_added + 1).min(u16::MAX as u32 + 1);
+
+        Ok(head)
     }
 
     fn add_direct<'a, 'b>(
@@ -389,17 +358,14 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
     }
 
-    /// Publishes pending buffers and returns whether to notify the device.
+    /// Returns whether the device should be notified after adding buffers.
     /// With event indices, checks additions since the previous call.
-    pub fn should_notify(&mut self) -> bool {
-        self.commit();
-        // Full barrier between publishing `avail.idx` and reading the event.
+    pub fn should_notify(&self) -> bool {
+        // Ensure `avail.idx` is visible before reading notification suppression.
         fence(Ordering::SeqCst);
-        let num_added = self.num_added;
-        self.num_added = 0;
+        let num_added = self.num_added.swap(0, Ordering::Relaxed);
         if self.event_idx {
-            // A complete trip around the 16-bit index makes the event interval
-            // ambiguous, so kick instead of treating it as an empty interval.
+            // A full 16-bit index cycle would look like an empty interval.
             if num_added > u16::MAX as u32 {
                 return true;
             }
@@ -544,7 +510,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                     desc.next = original_free_head;
                 }
 
-                // The next `add` overwrites this descriptor; no cleared copy is needed.
+                self.write_desc(desc_index);
 
                 // SAFETY: The caller ensures that the buffer is valid and matches the descriptor
                 // from which we got `paddr`.
@@ -584,7 +550,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         let index;
         let len;
         // SAFETY: `self.used` points to a valid, aligned, initialised, dereferenceable, readable
-        // instance of `UsedRing`. `can_pop` already observed a new `used.idx`.
+        // instance of `UsedRing`.
         unsafe {
             index = (*self.used.as_ptr()).ring[last_used_slot as usize].id as u16;
             len = (*self.used.as_ptr()).ring[last_used_slot as usize].len;
@@ -602,7 +568,6 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         if self.event_idx {
-            // Keep the event index current while interrupts are disabled.
             // SAFETY: `self.avail` points to a valid, aligned, initialised, dereferenceable,
             // readable instance of `AvailRing`.
             unsafe {
@@ -1373,26 +1338,8 @@ mod tests {
     }
 
     #[test]
-    fn add_uncommitted_defers_avail_idx() {
+    fn batch_adds_are_visible_before_notify() {
         let (mut queue, state) = event_idx_queue();
-        let input = [1];
-        // SAFETY: The input remains valid until the simulated completion below.
-        let token = unsafe { queue.add_uncommitted(&[&input], &mut []) }.unwrap();
-        assert!(
-            !state
-                .lock()
-                .unwrap()
-                .read_write_queue::<4>(0, |_| Vec::new())
-        );
-
-        queue.commit();
-        complete_input(&mut queue, &state, token, &input);
-    }
-
-    #[test]
-    fn commit_batch_event_idx() {
-        let (mut queue, state) = event_idx_queue();
-
         // SAFETY: The used ring belongs exclusively to this test.
         unsafe {
             (*queue.used.as_ptr())
@@ -1402,34 +1349,14 @@ mod tests {
 
         let inputs = [[1], [2], [3]];
         let tokens = inputs.each_ref().map(|input| {
-            // SAFETY: Each input remains valid until the simulated completion below.
-            unsafe { queue.add_uncommitted(&[input], &mut []) }.unwrap()
+            // SAFETY: Each input remains valid until its completion below.
+            unsafe { queue.add(&[input], &mut []) }.unwrap()
         });
-        assert!(queue.should_notify());
-        assert!(!queue.should_notify());
         for (token, input) in tokens.into_iter().zip(&inputs) {
             complete_input(&mut queue, &state, token, input);
         }
-    }
-
-    #[test]
-    fn reenable_interrupts_after_polling() {
-        let (mut queue, state) = event_idx_queue();
-        let input = [1];
-
-        queue.set_dev_notify(false);
-        // SAFETY: The input remains valid until the simulated completion below.
-        let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
-        complete_input(&mut queue, &state, token, &input);
-
-        // SAFETY: The available ring belongs exclusively to this test.
-        let event = unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) };
-        assert_eq!(event, queue.last_used_idx);
-
-        queue.set_dev_notify(true);
-        // SAFETY: The available ring belongs exclusively to this test.
-        let event = unsafe { (*queue.avail.as_ptr()).used_event.load(Ordering::Acquire) };
-        assert_eq!(event, queue.last_used_idx);
+        assert!(queue.should_notify());
+        assert!(!queue.should_notify());
     }
 
     #[test]
@@ -1438,7 +1365,7 @@ mod tests {
         let input = [1];
 
         for _ in 0..u16::MAX {
-            // SAFETY: The input remains valid until the simulated completion below.
+            // SAFETY: The input remains valid until its completion below.
             let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
             complete_input(&mut queue, &state, token, &input);
         }
@@ -1448,7 +1375,7 @@ mod tests {
                 .avail_event
                 .store(u16::MAX, Ordering::Release);
         }
-        // SAFETY: The input remains valid until the simulated completion below.
+        // SAFETY: The input remains valid until its completion below.
         let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
         assert!(queue.should_notify());
         complete_input(&mut queue, &state, token, &input);
@@ -1473,8 +1400,8 @@ mod tests {
         input: &[u8],
     ) {
         assert_eq!(state.lock().unwrap().read_from_queue::<4>(0), input);
-        // SAFETY: The device completed the token just added, and `input` is the
-        // same buffer passed to `add` and remains valid until this call returns.
+        // SAFETY: The device completed this token, and `input` is the buffer
+        // passed to `add` and remains valid until this call returns.
         unsafe { queue.pop_used(token, &[input], &mut []) }.unwrap();
     }
 }

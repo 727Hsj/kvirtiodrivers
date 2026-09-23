@@ -33,11 +33,10 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
         for (i, rx_buf_place) in rx_buffers.iter_mut().enumerate() {
             let mut rx_buf = RxBuffer::new(i, buf_len, inner.legacy_header);
             // SAFETY: The buffer lives as long as the queue.
-            let token = unsafe { inner.receive_add(rx_buf.as_bytes_mut())? };
+            let token = unsafe { inner.receive_begin(rx_buf.as_bytes_mut())? };
             assert_eq!(token, i as u16);
             *rx_buf_place = Some(rx_buf);
         }
-        inner.receive_commit();
 
         Ok(VirtIONet { inner, rx_buffers })
     }

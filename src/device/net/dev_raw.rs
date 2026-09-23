@@ -219,29 +219,30 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     pub unsafe fn receive_begin(&mut self, rx_buf: &mut [u8]) -> Result<u16> {
         // SAFETY: The caller promises that `rx_buf` is not accessed before the request completes.
         let token = unsafe { self.receive_add(rx_buf)? };
-        self.receive_commit();
+        self.receive_notify();
         Ok(token)
     }
 
-    /// Submits a receive buffer without publishing `avail.idx` or notifying.
+    /// Publishes a receive buffer without notifying the device.
     ///
-    /// Call [`receive_commit`] after a batch of additions so the device sees
-    /// the new buffers and is kicked at most once.
+    /// Call [`receive_notify`] after a batch of additions.
     ///
     /// # Safety
     ///
     /// Same as [`receive_begin`].
     ///
     /// [`receive_begin`]: Self::receive_begin
-    /// [`receive_commit`]: Self::receive_commit
+    /// [`receive_notify`]: Self::receive_notify
     pub unsafe fn receive_add(&mut self, rx_buf: &mut [u8]) -> Result<u16> {
         Self::check_rx_buf_len(rx_buf)?;
         // SAFETY: The caller promises that `rx_buf` is not accessed before the request completes.
-        unsafe { self.recv_queue.add_uncommitted(&[], &mut [rx_buf]) }
+        unsafe { self.recv_queue.add(&[], &mut [rx_buf]) }
     }
 
-    /// Publishes pending receive buffers and notifies the device if required.
-    pub fn receive_commit(&mut self) {
+    /// Notifies the device if required after one or more calls to [`receive_add`].
+    ///
+    /// [`receive_add`]: Self::receive_add
+    pub fn receive_notify(&mut self) {
         if self.recv_queue.should_notify() {
             self.transport.notify(QUEUE_RECEIVE);
         }

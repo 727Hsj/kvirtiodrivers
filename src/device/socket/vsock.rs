@@ -312,7 +312,7 @@ impl<H: Hal, T: Transport, const RX_BUFFER_SIZE: usize> VirtIOSocket<H, T, RX_BU
             negotiated_features.contains(Feature::ACCESS_PLATFORM),
         )?;
 
-        let mut rx = OwningQueue::new(rx)?;
+        let rx = OwningQueue::new(rx)?;
 
         transport.finish_init();
         if rx.should_notify() {

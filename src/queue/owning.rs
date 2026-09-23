@@ -24,11 +24,10 @@ impl<H: Hal, const SIZE: usize, const BUFFER_SIZE: usize> OwningQueue<H, SIZE, B
             let mut buffer: Box<[u8; BUFFER_SIZE]> = FromZeros::new_box_zeroed().unwrap();
             // SAFETY: The buffer lives as long as the queue, as specified in the function safety
             // requirement, and we don't access it until it is popped.
-            let token = unsafe { queue.add_uncommitted(&[], &mut [buffer.as_mut_slice()]) }?;
+            let token = unsafe { queue.add(&[], &mut [buffer.as_mut_slice()]) }?;
             assert_eq!(i, token.into());
             *queue_buffer = Box::into_raw(buffer);
         }
-        queue.commit();
         let buffers = buffers.map(|ptr| NonNull::new(ptr).unwrap());
 
         Ok(Self { queue, buffers })
@@ -38,7 +37,7 @@ impl<H: Hal, const SIZE: usize, const BUFFER_SIZE: usize> OwningQueue<H, SIZE, B
     /// virtqueue.
     ///
     /// This will be false if the device has suppressed notifications.
-    pub fn should_notify(&mut self) -> bool {
+    pub fn should_notify(&self) -> bool {
         self.queue.should_notify()
     }
 
@@ -145,7 +144,7 @@ where
 {
 }
 
-// SAFETY: An `&OwningQueue` does not mutate queue state.
+// SAFETY: An `&OwningQueue` only allows calling `should_notify`.
 unsafe impl<H: Hal, const SIZE: usize, const BUFFER_SIZE: usize> Sync
     for OwningQueue<H, SIZE, BUFFER_SIZE>
 where
