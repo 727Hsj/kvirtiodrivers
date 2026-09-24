@@ -28,9 +28,9 @@ const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
 /// # Example
 ///
 /// ```
-/// # use virtio_drivers::{Error, Hal};
-/// # use virtio_drivers::transport::Transport;
-/// use virtio_drivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
+/// # use kvirtiodrivers::{Error, Hal};
+/// # use kvirtiodrivers::transport::Transport;
+/// use kvirtiodrivers::device::blk::{VirtIOBlk, SECTOR_SIZE};
 ///
 /// # fn example<HalImpl: Hal, T: Transport>(transport: T) -> Result<(), Error> {
 /// let mut disk = VirtIOBlk::<HalImpl, _>::new(transport)?;
@@ -215,10 +215,10 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     /// the same buffers before reading the response.
     ///
     /// ```
-    /// # use virtio_drivers::{Error, Hal};
-    /// # use virtio_drivers::device::blk::VirtIOBlk;
-    /// # use virtio_drivers::transport::Transport;
-    /// use virtio_drivers::device::blk::{BlkReq, BlkResp, RespStatus};
+    /// # use kvirtiodrivers::{Error, Hal};
+    /// # use kvirtiodrivers::device::blk::VirtIOBlk;
+    /// # use kvirtiodrivers::transport::Transport;
+    /// use kvirtiodrivers::device::blk::{BlkReq, BlkResp, RespStatus};
     ///
     /// # fn example<H: Hal, T: Transport>(blk: &mut VirtIOBlk<H, T>) -> Result<(), Error> {
     /// let mut request = BlkReq::default();
@@ -409,7 +409,10 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         };
         // SAFETY: The caller promises that `req` and `resp` are not accessed
         // before the request is completed.
-        let token = unsafe { self.queue.add(&[req.as_bytes()], &mut [resp.as_mut_bytes()])? };
+        let token = unsafe {
+            self.queue
+                .add(&[req.as_bytes()], &mut [resp.as_mut_bytes()])?
+        };
         if self.queue.should_notify() {
             self.transport.notify(QUEUE);
         }

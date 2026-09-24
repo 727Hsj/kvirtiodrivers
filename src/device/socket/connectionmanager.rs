@@ -22,9 +22,9 @@ const DEFAULT_PER_CONNECTION_BUFFER_CAPACITY: u32 = 1024;
 /// # Example
 ///
 /// ```
-/// # use virtio_drivers::{Error, Hal};
-/// # use virtio_drivers::transport::Transport;
-/// use virtio_drivers::device::socket::{VirtIOSocket, VsockAddr, VsockConnectionManager};
+/// # use kvirtiodrivers::{Error, Hal};
+/// # use kvirtiodrivers::transport::Transport;
+/// use kvirtiodrivers::device::socket::{VirtIOSocket, VsockAddr, VsockConnectionManager};
 ///
 /// # fn example<HalImpl: Hal, T: Transport>(transport: T) -> Result<(), Error> {
 /// let mut socket = VsockConnectionManager::new(VirtIOSocket::<HalImpl, _>::new(transport)?);
