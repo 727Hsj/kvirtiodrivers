@@ -12,7 +12,7 @@
 //!
 //! ```
 //! use core::ptr::NonNull;
-//! use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+//! use kvirtiodrivers::transport::mmio::{MmioTransport, VirtIOHeader};
 //!
 //! # fn example(mmio_device_address: usize, mmio_size: usize) {
 //! let header = NonNull::new(mmio_device_address as *mut VirtIOHeader).unwrap();
@@ -25,8 +25,8 @@
 //! ```
 //! # #[cfg(feature = "alloc")]
 //! # mod __wrapper {
-//! # use virtio_drivers::Hal;
-//! use virtio_drivers::{
+//! # use kvirtiodrivers::Hal;
+//! use kvirtiodrivers::{
 //!     device::console::VirtIOConsole,
 //!     transport::{mmio::MmioTransport, DeviceType, Transport},
 //! };
