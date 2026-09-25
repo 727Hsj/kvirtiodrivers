@@ -217,13 +217,35 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     /// [`poll_receive`]: Self::poll_receive
     /// [`receive_complete`]: Self::receive_complete
     pub unsafe fn receive_begin(&mut self, rx_buf: &mut [u8]) -> Result<u16> {
+        // SAFETY: The caller promises that `rx_buf` is not accessed before the request completes.
+        let token = unsafe { self.receive_add(rx_buf)? };
+        self.receive_notify();
+        Ok(token)
+    }
+
+    /// Publishes a receive buffer without notifying the device.
+    ///
+    /// Call [`receive_notify`] after a batch of additions.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`receive_begin`].
+    ///
+    /// [`receive_begin`]: Self::receive_begin
+    /// [`receive_notify`]: Self::receive_notify
+    pub unsafe fn receive_add(&mut self, rx_buf: &mut [u8]) -> Result<u16> {
         Self::check_rx_buf_len(rx_buf)?;
         // SAFETY: The caller promises that `rx_buf` is not accessed before the request completes.
-        let token = unsafe { self.recv_queue.add(&[], &mut [rx_buf])? };
+        unsafe { self.recv_queue.add(&[], &mut [rx_buf]) }
+    }
+
+    /// Notifies the device if required after one or more calls to [`receive_add`].
+    ///
+    /// [`receive_add`]: Self::receive_add
+    pub fn receive_notify(&mut self) {
         if self.recv_queue.should_notify() {
             self.transport.notify(QUEUE_RECEIVE);
         }
-        Ok(token)
     }
 
     /// Fetches the token of the next completed reception request from the

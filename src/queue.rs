@@ -23,7 +23,7 @@ use core::mem::{size_of, take};
 #[cfg(test)]
 use core::ptr;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU16, Ordering, fence};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering, fence};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 /// The mechanism for bulk data transport on virtio devices.
@@ -61,6 +61,8 @@ pub struct VirtQueue<H: Hal, const SIZE: usize> {
     desc_shadow: [Descriptor; SIZE],
     /// Our trusted copy of `avail.idx`.
     avail_idx: u16,
+    /// Additions since the last [`Self::should_notify`], capped at 2^16.
+    num_added: AtomicU32,
     last_used_idx: u16,
     /// Whether the `VIRTIO_F_EVENT_IDX` feature has been negotiated.
     event_idx: bool,
@@ -142,6 +144,7 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
             free_head: 0,
             desc_shadow,
             avail_idx: 0,
+            num_added: AtomicU32::new(0),
             last_used_idx: 0,
             event_idx,
             access_platform,
@@ -212,6 +215,8 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
                 .idx
                 .store(self.avail_idx, Ordering::Release);
         }
+        let num_added = self.num_added.get_mut();
+        *num_added = (*num_added + 1).min(u16::MAX as u32 + 1);
 
         Ok(head)
     }
@@ -353,16 +358,23 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         }
     }
 
-    /// Returns whether the driver should notify the device after adding a new buffer to the
-    /// virtqueue.
-    ///
-    /// This will be false if the device has suppressed notifications.
+    /// Returns whether the device should be notified after adding buffers.
+    /// With event indices, checks additions since the previous call.
     pub fn should_notify(&self) -> bool {
+        // Ensure `avail.idx` is visible before reading notification suppression.
+        fence(Ordering::SeqCst);
+        let num_added = self.num_added.swap(0, Ordering::Relaxed);
         if self.event_idx {
+            // A full 16-bit index cycle would look like an empty interval.
+            if num_added > u16::MAX as u32 {
+                return true;
+            }
+            let new = self.avail_idx;
+            let old = new.wrapping_sub(num_added as u16);
             // SAFETY: `self.used` points to a valid, aligned, initialised, dereferenceable, readable
             // instance of `UsedRing`.
             let avail_event = unsafe { (*self.used.as_ptr()).avail_event.load(Ordering::Acquire) };
-            self.avail_idx >= avail_event.wrapping_add(1)
+            vring_need_event(avail_event, new, old)
         } else {
             // SAFETY: `self.used` points to a valid, aligned, initialised, dereferenceable, readable
             // instance of `UsedRing`.
@@ -713,6 +725,13 @@ impl<H: Hal> VirtQueueLayout<H> {
             } => device_to_driver_dma.vaddr(0),
         }
     }
+}
+
+/// Checks whether advancing from `old` to `new_idx` crosses `event_idx + 1`.
+///
+/// Ref: Linux `include/uapi/linux/virtio_ring.h` `vring_need_event`.
+fn vring_need_event(event_idx: u16, new_idx: u16, old: u16) -> bool {
+    new_idx.wrapping_sub(event_idx).wrapping_sub(1) < new_idx.wrapping_sub(old)
 }
 
 /// Returns the size in bytes of the descriptor table, available ring and used ring for a given
@@ -1316,5 +1335,73 @@ mod tests {
 
         // Check that the transport should be notified again now.
         assert_eq!(queue.should_notify(), true);
+    }
+
+    #[test]
+    fn batch_adds_are_visible_before_notify() {
+        let (mut queue, state) = event_idx_queue();
+        // SAFETY: The used ring belongs exclusively to this test.
+        unsafe {
+            (*queue.used.as_ptr())
+                .avail_event
+                .store(2, Ordering::Release);
+        }
+
+        let inputs = [[1], [2], [3]];
+        let tokens = inputs.each_ref().map(|input| {
+            // SAFETY: Each input remains valid until its completion below.
+            unsafe { queue.add(&[input], &mut []) }.unwrap()
+        });
+        for (token, input) in tokens.into_iter().zip(&inputs) {
+            complete_input(&mut queue, &state, token, input);
+        }
+        assert!(queue.should_notify());
+        assert!(!queue.should_notify());
+    }
+
+    #[test]
+    fn notify_after_full_index_wrap() {
+        let (mut queue, state) = event_idx_queue();
+        let input = [1];
+
+        for _ in 0..u16::MAX {
+            // SAFETY: The input remains valid until its completion below.
+            let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
+            complete_input(&mut queue, &state, token, &input);
+        }
+        // SAFETY: The used ring belongs exclusively to this test.
+        unsafe {
+            (*queue.used.as_ptr())
+                .avail_event
+                .store(u16::MAX, Ordering::Release);
+        }
+        // SAFETY: The input remains valid until its completion below.
+        let token = unsafe { queue.add(&[&input], &mut []) }.unwrap();
+        assert!(queue.should_notify());
+        complete_input(&mut queue, &state, token, &input);
+    }
+
+    fn event_idx_queue() -> (VirtQueue<FakeHal, 4>, Arc<Mutex<State<()>>>) {
+        let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default()], ())));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::Block,
+            max_queue_size: 4,
+            device_features: Feature::RING_EVENT_IDX.bits(),
+            state: state.clone(),
+        };
+        let queue = VirtQueue::new(&mut transport, 0, false, true, false).unwrap();
+        (queue, state)
+    }
+
+    fn complete_input(
+        queue: &mut VirtQueue<FakeHal, 4>,
+        state: &Arc<Mutex<State<()>>>,
+        token: u16,
+        input: &[u8],
+    ) {
+        assert_eq!(state.lock().unwrap().read_from_queue::<4>(0), input);
+        // SAFETY: The device completed this token, and `input` is the buffer
+        // passed to `add` and remains valid until this call returns.
+        unsafe { queue.pop_used(token, &[input], &mut []) }.unwrap();
     }
 }
