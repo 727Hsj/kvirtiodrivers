@@ -11,7 +11,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const QUEUE: u16 = 0;
 const QUEUE_SIZE: u16 = 16;
+/// Maximum data descriptors after reserving the header and status descriptors.
+pub const MAX_DATA_SEGMENTS: usize = QUEUE_SIZE as usize - 2;
 const SUPPORTED_FEATURES: BlkFeature = BlkFeature::RO
+    .union(BlkFeature::SEG_MAX)
+    .union(BlkFeature::SIZE_MAX)
     .union(BlkFeature::FLUSH)
     .union(BlkFeature::RING_INDIRECT_DESC)
     .union(BlkFeature::RING_EVENT_IDX)
@@ -49,6 +53,8 @@ pub struct VirtIOBlk<H: Hal, T: Transport> {
     queue: VirtQueue<H, { QUEUE_SIZE as usize }>,
     capacity: u64,
     negotiated_features: BlkFeature,
+    max_segments: usize,
+    max_segment_size: usize,
 }
 
 impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
@@ -63,6 +69,20 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         })?;
         info!("found a block device of size {}KB", capacity / 2);
 
+        let max_segments = if negotiated_features.contains(BlkFeature::SEG_MAX) {
+            read_config!(transport, BlkConfig, seg_max)? as usize
+        } else {
+            1
+        }
+        .clamp(1, MAX_DATA_SEGMENTS);
+        let max_segment_size = if negotiated_features.contains(BlkFeature::SIZE_MAX) {
+            read_config!(transport, BlkConfig, size_max)? as usize
+        } else {
+            u32::MAX as usize
+        };
+        if max_segments == 0 || max_segment_size < SECTOR_SIZE {
+            return Err(Error::InvalidParam);
+        }
         let queue = VirtQueue::new(
             &mut transport,
             QUEUE,
@@ -77,6 +97,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             queue,
             capacity,
             negotiated_features,
+            max_segments,
+            max_segment_size,
         })
     }
 
@@ -177,6 +199,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     ///
     /// Blocks until the read completes or there is an error.
     pub fn read_blocks(&mut self, block_id: usize, buf: &mut [u8]) -> Result {
+        self.validate_segments(core::iter::once(buf.len()))?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.request_read(
@@ -253,23 +276,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &mut [u8],
         resp: &mut BlkResp,
     ) -> Result<u16> {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        *req = BlkReq {
-            type_: ReqType::In,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        // SAFETY: The caller promises that `req`, `buf` and `resp` are not accessed before the
-        // request is completed.
-        let token = unsafe {
-            self.queue
-                .add(&[req.as_bytes()], &mut [buf, resp.as_mut_bytes()])?
-        };
-        if self.queue.should_notify() {
-            self.transport.notify(QUEUE);
-        }
-        Ok(token)
+        // SAFETY: the single segment has exactly the lifetime promised by the caller.
+        unsafe { self.read_blocks_sg_nb(block_id, req, &mut [buf], resp) }
     }
 
     /// Completes a read operation which was started by `read_blocks_nb`.
@@ -285,13 +293,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &mut [u8],
         resp: &mut BlkResp,
     ) -> Result<()> {
-        // SAFETY: The caller promises that `req`, `buf` and `resp` are the same that were passed to
-        // the corresponding `read_blocks_nb` call which added them to the queue.
-        unsafe {
-            self.queue
-                .pop_used(token, &[req.as_bytes()], &mut [buf, resp.as_mut_bytes()])?;
-        }
-        resp.status.into()
+        // SAFETY: this is the original segment for the supplied token.
+        unsafe { self.complete_read_blocks_sg(token, req, &mut [buf], resp) }
     }
 
     /// Writes the contents of the given buffer to a block or blocks.
@@ -300,6 +303,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     ///
     /// Blocks until the write is complete or there is an error.
     pub fn write_blocks(&mut self, block_id: usize, buf: &[u8]) -> Result {
+        self.validate_segments(core::iter::once(buf.len()))?;
         assert_ne!(buf.len(), 0);
         assert_eq!(buf.len() % SECTOR_SIZE, 0);
         self.request_write(
@@ -342,23 +346,8 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &[u8],
         resp: &mut BlkResp,
     ) -> Result<u16> {
-        assert_ne!(buf.len(), 0);
-        assert_eq!(buf.len() % SECTOR_SIZE, 0);
-        *req = BlkReq {
-            type_: ReqType::Out,
-            reserved: 0,
-            sector: block_id as u64,
-        };
-        // SAFETY: The caller promises that `req`, `buf` and `resp` are not accessed before the
-        // request is completed.
-        let token = unsafe {
-            self.queue
-                .add(&[req.as_bytes(), buf], &mut [resp.as_mut_bytes()])?
-        };
-        if self.queue.should_notify() {
-            self.transport.notify(QUEUE);
-        }
-        Ok(token)
+        // SAFETY: the single segment has exactly the lifetime promised by the caller.
+        unsafe { self.write_blocks_sg_nb(block_id, req, &[buf], resp) }
     }
 
     /// Completes a write operation which was started by `write_blocks_nb`.
@@ -374,11 +363,158 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buf: &[u8],
         resp: &mut BlkResp,
     ) -> Result<()> {
-        // SAFETY: The caller promises that `req`, `buf` and `resp` are the same that were passed to
-        // the corresponding `write_blocks_nb` call which added them to the queue.
+        // SAFETY: this is the original segment for the supplied token.
+        unsafe { self.complete_write_blocks_sg(token, req, &[buf], resp) }
+    }
+
+    /// Maximum data segments in one descriptor chain, including the virtqueue limit.
+    pub fn max_segments(&self) -> usize {
+        self.max_segments
+    }
+
+    /// Maximum bytes in each data segment, as negotiated with the device.
+    pub fn max_segment_size(&self) -> usize {
+        self.max_segment_size
+    }
+
+    fn validate_segments(&self, lengths: impl ExactSizeIterator<Item = usize>) -> Result {
+        if lengths.len() == 0 || lengths.len() > self.max_segments {
+            return Err(Error::InvalidParam);
+        }
+        let mut total = 0usize;
+        for len in lengths {
+            if len == 0 || len > self.max_segment_size {
+                return Err(Error::InvalidParam);
+            }
+            total = total.checked_add(len).ok_or(Error::InvalidParam)?;
+        }
+        if !total.is_multiple_of(SECTOR_SIZE) {
+            return Err(Error::InvalidParam);
+        }
+        Ok(())
+    }
+
+    /// Submits a scatter read without copying payloads. Only the combined length
+    /// must be sector-aligned; each segment must satisfy the advertised limits.
+    /// Invalid input publishes no descriptors. QueueFull may be retried unchanged.
+    ///
+    /// # Safety
+    /// All payloads, `req` and `resp` must remain live, stable and inaccessible to
+    /// the CPU until `complete_read_blocks_sg` retires the returned token. The
+    /// temporary slice of references itself need not survive this call.
+    pub unsafe fn read_blocks_sg_nb(
+        &mut self,
+        block_id: usize,
+        req: &mut BlkReq,
+        buffers: &mut [&mut [u8]],
+        resp: &mut BlkResp,
+    ) -> Result<u16> {
+        self.validate_segments(buffers.iter().map(|buf| buf.len()))?;
+        *req = BlkReq {
+            type_: ReqType::In,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut outputs: [&mut [u8]; QUEUE_SIZE as usize - 1] =
+            core::array::from_fn(|_| &mut [][..]);
+        let count = buffers.len();
+        for (output, buffer) in outputs.iter_mut().zip(buffers.iter_mut()) {
+            *output = buffer;
+        }
+        outputs[count] = resp.as_mut_bytes();
+        // SAFETY: the caller retains all disjoint buffers until completion.
+        let token = unsafe {
+            self.queue
+                .add(&[req.as_bytes()], &mut outputs[..count + 1])?
+        };
+        if self.queue.should_notify() {
+            self.transport.notify(QUEUE);
+        }
+        Ok(token)
+    }
+
+    /// Retires a scatter read and returns the device status after unmapping.
+    ///
+    /// # Safety
+    /// Pass the same ordered segments and protocol storage used to submit token.
+    /// The token must have been reported by `peek_used` and not yet reclaimed.
+    pub unsafe fn complete_read_blocks_sg(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        buffers: &mut [&mut [u8]],
+        resp: &mut BlkResp,
+    ) -> Result {
+        let mut outputs: [&mut [u8]; QUEUE_SIZE as usize - 1] =
+            core::array::from_fn(|_| &mut [][..]);
+        let count = buffers.len();
+        for (output, buffer) in outputs.iter_mut().zip(buffers.iter_mut()) {
+            *output = buffer;
+        }
+        outputs[count] = resp.as_mut_bytes();
+        // SAFETY: the caller supplies token's exact original storage after completion.
         unsafe {
             self.queue
-                .pop_used(token, &[req.as_bytes(), buf], &mut [resp.as_mut_bytes()])?;
+                .pop_used(token, &[req.as_bytes()], &mut outputs[..count + 1])?;
+        }
+        resp.status.into()
+    }
+
+    /// Submits a scatter write without copying payloads. Segment limits and
+    /// lifetime requirements are the same as `read_blocks_sg_nb`.
+    ///
+    /// # Safety
+    /// Keep all payloads and protocol storage stable and inaccessible until
+    /// `complete_write_blocks_sg` retires the returned token.
+    pub unsafe fn write_blocks_sg_nb(
+        &mut self,
+        block_id: usize,
+        req: &mut BlkReq,
+        buffers: &[&[u8]],
+        resp: &mut BlkResp,
+    ) -> Result<u16> {
+        self.validate_segments(buffers.iter().map(|buf| buf.len()))?;
+        *req = BlkReq {
+            type_: ReqType::Out,
+            reserved: 0,
+            sector: block_id as u64,
+        };
+        let mut inputs = [&[][..]; QUEUE_SIZE as usize - 1];
+        inputs[0] = req.as_bytes();
+        inputs[1..buffers.len() + 1].copy_from_slice(buffers);
+        // SAFETY: the caller retains all disjoint buffers until completion.
+        let token = unsafe {
+            self.queue
+                .add(&inputs[..buffers.len() + 1], &mut [resp.as_mut_bytes()])?
+        };
+        if self.queue.should_notify() {
+            self.transport.notify(QUEUE);
+        }
+        Ok(token)
+    }
+
+    /// Retires a scatter write and returns the device status after unmapping.
+    ///
+    /// # Safety
+    /// Pass the same ordered segments and protocol storage used to submit token.
+    /// The token must have been reported by `peek_used` and not yet reclaimed.
+    pub unsafe fn complete_write_blocks_sg(
+        &mut self,
+        token: u16,
+        req: &BlkReq,
+        buffers: &[&[u8]],
+        resp: &mut BlkResp,
+    ) -> Result {
+        let mut inputs = [&[][..]; QUEUE_SIZE as usize - 1];
+        inputs[0] = req.as_bytes();
+        inputs[1..buffers.len() + 1].copy_from_slice(buffers);
+        // SAFETY: the caller supplies token's exact original storage after completion.
+        unsafe {
+            self.queue.pop_used(
+                token,
+                &inputs[..buffers.len() + 1],
+                &mut [resp.as_mut_bytes()],
+            )?;
         }
         resp.status.into()
     }
@@ -638,6 +774,124 @@ mod tests {
     use alloc::{sync::Arc, vec};
     use core::mem::size_of;
     use std::{sync::Mutex, thread};
+
+    #[test]
+    fn scatter_read_write_limits_and_error_retirement() {
+        for indirect in [BlkFeature::empty(), BlkFeature::RING_INDIRECT_DESC] {
+            let config = BlkConfig {
+                capacity_low: ReadOnly::new(66),
+                capacity_high: ReadOnly::new(0),
+                size_max: ReadOnly::new(512),
+                seg_max: ReadOnly::new(2),
+                cylinders: ReadOnly::new(0),
+                heads: ReadOnly::new(0),
+                sectors: ReadOnly::new(0),
+                blk_size: ReadOnly::new(0),
+                physical_block_exp: ReadOnly::new(0),
+                alignment_offset: ReadOnly::new(0),
+                min_io_size: ReadOnly::new(0),
+                opt_io_size: ReadOnly::new(0),
+            };
+            let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default()], config)));
+            let transport = FakeTransport {
+                device_type: DeviceType::Block,
+                max_queue_size: QUEUE_SIZE.into(),
+                device_features: (indirect | BlkFeature::SEG_MAX | BlkFeature::SIZE_MAX).bits(),
+                state: state.clone(),
+            };
+            let mut blk = VirtIOBlk::<FakeHal, _>::new(transport).unwrap();
+            assert_eq!(blk.max_segments(), 2);
+            assert_eq!(blk.max_segment_size(), 512);
+            let mut req = BlkReq::default();
+            let mut resp = BlkResp::default();
+            let mut oversized = [0; 1024];
+            // SAFETY: validation fails before publication; all storage remains live.
+            assert_eq!(
+                // SAFETY: validation fails before publishing these live buffers.
+                unsafe { blk.read_blocks_sg_nb(0, &mut req, &mut [&mut oversized], &mut resp) },
+                Err(Error::InvalidParam)
+            );
+            assert_eq!(blk.peek_used(), None);
+            for is_read in [true, false] {
+                for status in [0, 1] {
+                    let mut first = [0x37; 17];
+                    let mut second = [0x37; 495];
+                    let token = if is_read {
+                        // SAFETY: disjoint stable local arrays survive until retirement below.
+                        unsafe {
+                            blk.read_blocks_sg_nb(
+                                7,
+                                &mut req,
+                                &mut [&mut first, &mut second],
+                                &mut resp,
+                            )
+                        }
+                        .unwrap()
+                    } else {
+                        // SAFETY: stable initialized sources and protocol storage survive retirement.
+                        unsafe {
+                            blk.write_blocks_sg_nb(7, &mut req, &[&first, &second], &mut resp)
+                        }
+                        .unwrap()
+                    };
+                    assert!(
+                        state
+                            .lock()
+                            .unwrap()
+                            .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE, |request| {
+                                assert_eq!(
+                                    &request[..16],
+                                    BlkReq {
+                                        type_: if is_read { ReqType::In } else { ReqType::Out },
+                                        reserved: 0,
+                                        sector: 7
+                                    }
+                                    .as_bytes()
+                                );
+                                let mut response = if is_read {
+                                    vec![0xa5; 512]
+                                } else {
+                                    assert_eq!(&request[16..], &[0x37; 512]);
+                                    Vec::new()
+                                };
+                                response.push(status);
+                                response
+                            })
+                    );
+                    assert_eq!(blk.peek_used(), Some(token));
+                    let result = if is_read {
+                        // SAFETY: the device reported token; these are its exact original buffers.
+                        unsafe {
+                            blk.complete_read_blocks_sg(
+                                token,
+                                &req,
+                                &mut [&mut first, &mut second],
+                                &mut resp,
+                            )
+                        }
+                    } else {
+                        // SAFETY: the device reported token; these are its exact original buffers.
+                        unsafe {
+                            blk.complete_write_blocks_sg(token, &req, &[&first, &second], &mut resp)
+                        }
+                    };
+                    assert_eq!(
+                        result,
+                        if status == 0 {
+                            Ok(())
+                        } else {
+                            Err(Error::IoError)
+                        }
+                    );
+                    assert_eq!(blk.peek_used(), None);
+                    if is_read {
+                        assert_eq!(first, [0xa5; 17]);
+                        assert_eq!(second, [0xa5; 495]);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn config() {
