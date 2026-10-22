@@ -80,7 +80,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         } else {
             u32::MAX as usize
         };
-        if max_segments == 0 || max_segment_size < SECTOR_SIZE {
+        if max_segment_size == 0 {
             return Err(Error::InvalidParam);
         }
         let queue = VirtQueue::new(
@@ -373,6 +373,9 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
     }
 
     /// Maximum bytes in each data segment, as negotiated with the device.
+    ///
+    /// This may be smaller than a sector; sector alignment applies to the
+    /// combined length of a read or write request.
     pub fn max_segment_size(&self) -> usize {
         self.max_segment_size
     }
@@ -415,8 +418,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             reserved: 0,
             sector: block_id as u64,
         };
-        let mut outputs: [&mut [u8]; QUEUE_SIZE as usize - 1] =
-            core::array::from_fn(|_| &mut [][..]);
+        let mut outputs: [&mut [u8]; MAX_DATA_SEGMENTS + 1] = core::array::from_fn(|_| &mut [][..]);
         let count = buffers.len();
         for (output, buffer) in outputs.iter_mut().zip(buffers.iter_mut()) {
             *output = buffer;
@@ -445,8 +447,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buffers: &mut [&mut [u8]],
         resp: &mut BlkResp,
     ) -> Result {
-        let mut outputs: [&mut [u8]; QUEUE_SIZE as usize - 1] =
-            core::array::from_fn(|_| &mut [][..]);
+        let mut outputs: [&mut [u8]; MAX_DATA_SEGMENTS + 1] = core::array::from_fn(|_| &mut [][..]);
         let count = buffers.len();
         for (output, buffer) in outputs.iter_mut().zip(buffers.iter_mut()) {
             *output = buffer;
@@ -479,7 +480,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
             reserved: 0,
             sector: block_id as u64,
         };
-        let mut inputs = [&[][..]; QUEUE_SIZE as usize - 1];
+        let mut inputs = [&[][..]; MAX_DATA_SEGMENTS + 1];
         inputs[0] = req.as_bytes();
         inputs[1..buffers.len() + 1].copy_from_slice(buffers);
         // SAFETY: the caller retains all disjoint buffers until completion.
@@ -505,7 +506,7 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         buffers: &[&[u8]],
         resp: &mut BlkResp,
     ) -> Result {
-        let mut inputs = [&[][..]; QUEUE_SIZE as usize - 1];
+        let mut inputs = [&[][..]; MAX_DATA_SEGMENTS + 1];
         inputs[0] = req.as_bytes();
         inputs[1..buffers.len() + 1].copy_from_slice(buffers);
         // SAFETY: the caller supplies token's exact original storage after completion.
